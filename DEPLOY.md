@@ -6,7 +6,7 @@ Step-by-step deployment to Fly.io using PowerShell (Windows).
 
 ## Prerequisites
 
-1. Install [Fly CLI](https://fly.io/docs/flyctl/installing/): `iwr https://fly.io/install.ps1 -useb | iex`
+1. Install [Fly CLI](https://fly.io/docs/flyctl/install/): `iwr https://fly.io/install.ps1 -useb | iex`
 2. Login: `flyctl auth login`
 3. Have Git installed: https://git-scm.com/downloads
 
