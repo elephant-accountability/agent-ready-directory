@@ -1,0 +1,34 @@
+# lychee.toml — link-checker configuration for agent-ready-directory
+#
+# Why this file exists
+# --------------------
+# The GitHub Actions workflow (.github/workflows/links.yml) runs lychee against
+# all *.md and *.html files in the repo.  The static HTML files in
+# app/static/ contain absolute-path hrefs (e.g. /api/export.json,
+# /sitemap.xml, /api/docs) that are valid app routes served by the FastAPI
+# backend but do NOT exist as files on disk in the repository.  Without a
+# base_url, lychee resolves those paths as file:// URLs which produce a
+# "file not found" error and fail the check.
+#
+# Setting base_url tells lychee to resolve absolute-path hrefs against the
+# live production site, where every one of those routes returns HTTP 200.
+#
+# Track-A fix: DEPLOY.md — stale fly.io URL corrected inline (no toml needed)
+# Track-B fix: this file handles the file:// resolution problem + fly.dev exclude
+
+# Resolve absolute-path hrefs (e.g. /api/docs, /sitemap.xml, /llms.txt)
+# against the live directory site rather than as local file:// paths.
+# All of these routes return HTTP 200 on the live site.
+# TODO (Chris-UI): once a staging environment is provisioned, consider
+# switching to the staging origin so CI does not depend on production uptime.
+base_url = "https://directory.eaccountability.org"
+
+# Exclude the internal Fly.io origin hostname.  It is referenced only in
+# ops runbooks (RUNBOOK.md, MONITORING.md) as a curl target for health
+# checks — it is not a user-facing link and its TLS cert is not guaranteed
+# to be trusted by the GHA runner.
+# TODO: remove this exclude if the fly.dev subdomain is promoted to a
+# public-facing canonical URL.
+exclude = [
+    "^https?://agent-ready-directory\\.fly\\.dev",
+]
