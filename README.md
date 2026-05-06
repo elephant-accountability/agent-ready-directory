@@ -29,7 +29,7 @@ Live at: [directory.eaccountability.org](https://directory.eaccountability.org)
 ### Setup
 
 ```bash
-git clone https://github.com/Chris-Eaccountability/agent-ready-directory.git
+git clone https://github.com/elephant-accountability/agent-ready-directory.git
 cd agent-ready-directory
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
