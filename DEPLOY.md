@@ -16,7 +16,7 @@ Step-by-step deployment to Fly.io using PowerShell (Windows).
 
 ```powershell
 # 1. Clone the repo
-git clone https://github.com/Chris-Eaccountability/agent-ready-directory.git
+git clone https://github.com/elephant-accountability/agent-ready-directory.git
 cd agent-ready-directory
 
 # 2. Initialize Fly app (do NOT deploy yet)
