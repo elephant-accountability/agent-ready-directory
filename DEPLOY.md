@@ -6,7 +6,7 @@ Step-by-step deployment to Fly.io using PowerShell (Windows).
 
 ## Prerequisites
 
-1. Install [Fly CLI](https://fly.io/docs/flyctl/installing/): `iwr https://fly.io/install.ps1 -useb | iex`
+1. Install [Fly CLI](https://fly.io/docs/flyctl/install/): `iwr https://fly.io/install.ps1 -useb | iex`
 2. Login: `flyctl auth login`
 3. Have Git installed: https://git-scm.com/downloads
 
@@ -16,7 +16,7 @@ Step-by-step deployment to Fly.io using PowerShell (Windows).
 
 ```powershell
 # 1. Clone the repo
-git clone https://github.com/Chris-Eaccountability/agent-ready-directory.git
+git clone https://github.com/elephant-accountability/agent-ready-directory.git
 cd agent-ready-directory
 
 # 2. Initialize Fly app (do NOT deploy yet)
