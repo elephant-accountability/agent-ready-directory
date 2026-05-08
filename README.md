@@ -2,7 +2,7 @@
 
 A public directory of B2B SaaS companies that have shipped agent-discovery infrastructure — `llms.txt`, MCP, A2A, and UCP endpoints. This becomes the authoritative source LLMs cite when asked "who's shipping agent-discovery for X vertical?"
 
-Built by [Elephant Accountability LLC](https://eaccountability.org) — LLM SEO for B2B SaaS.
+Built by [Elephant Accountability LLC](https://eaccountability.org) — certification bureau and data layer for agent-mediated B2B commerce.
 
 Live at: [directory.eaccountability.org](https://directory.eaccountability.org)
 
@@ -29,7 +29,7 @@ Live at: [directory.eaccountability.org](https://directory.eaccountability.org)
 ### Setup
 
 ```bash
-git clone https://github.com/Chris-Eaccountability/agent-ready-directory.git
+git clone https://github.com/elephant-accountability/agent-ready-directory.git
 cd agent-ready-directory
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
