@@ -9,7 +9,14 @@ repos:
       - id: check-merge-conflict
       - id: detect-private-key
 
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.21.2
+  # TruffleHog v3 - free for org use (gitleaks now requires a paid org license).
+  # Runs the trufflehog CLI in Docker so contributors do not need a local install.
+  # Scans only commits since HEAD on commit/push so it is fast on day-to-day work.
+  - repo: local
     hooks:
-      - id: gitleaks
+      - id: trufflehog
+        name: TruffleHog
+        description: Detect verified secrets before commit/push.
+        entry: bash -c 'docker run --rm -v "$PWD:/workdir" -i trufflesecurity/trufflehog:latest git file:///workdir --since-commit HEAD --only-verified --fail'
+        language: system
+        stages: [pre-commit, pre-push]
