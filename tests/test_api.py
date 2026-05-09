@@ -314,10 +314,11 @@ class TestSubmissions:
     def test_submission_rate_limit(self, client, seeded_db):
         """More than 3 submissions from the same IP in 24h should return 429."""
         from datetime import datetime, timezone
-        import hashlib
-        # Insert 3 existing submissions with the same ip_hash as loopback
-        ip = "testclient"
-        ip_hash = hashlib.sha256(ip.encode()).hexdigest()
+        from app.server import _hash_ip
+        # Pre-seed three submissions whose ip_hash matches what the server will
+        # compute for the TestClient request below. _hash_ip is HMAC-keyed so
+        # we must use the same helper here, not raw sha256.
+        ip_hash = _hash_ip("testclient")
         now = datetime.now(timezone.utc).isoformat()
         for i in range(3):
             seeded_db.execute(
@@ -334,17 +335,24 @@ class TestSubmissions:
         })
         assert resp.status_code == 429
 
+    @patch("app.server._is_public_hostname", return_value=True)
     @patch("app.server._check_llms_txt", new_callable=AsyncMock)
     @patch("app.server._check_mcp", new_callable=AsyncMock)
     @patch("app.server._check_a2a", new_callable=AsyncMock)
     @patch("app.server._check_ucp", new_callable=AsyncMock)
     @patch("app.server._check_schema_org", new_callable=AsyncMock)
-    def test_submission_verified_if_surface_found(
+    def test_submission_pending_if_surface_found(
         self,
-        mock_schema, mock_ucp, mock_a2a, mock_mcp, mock_llms,
+        mock_schema, mock_ucp, mock_a2a, mock_mcp, mock_llms, mock_public,
         client
     ):
-        """If any surface passes, company should be added and status='verified'."""
+        """Even if a surface is detected, the row lands as 'pending'.
+
+        Brand-hijack fix: an attacker who controls evil.com could otherwise
+        publish /.well-known/mcp.json with {"name":"Microsoft"} and
+        self-publish a verified row. Detection still records the surfaces but
+        status='pending' until an admin promotes it.
+        """
         mock_llms.return_value = (True, "https://newco.io/llms.txt")
         mock_mcp.return_value = (False, None)
         mock_a2a.return_value = (False, None)
@@ -358,8 +366,10 @@ class TestSubmissions:
         })
         assert resp.status_code == 202
         data = resp.json()
-        assert data["status"] == "verified"
+        assert data["status"] == "pending"
+        assert data["surfaces"]["llms_txt"] is True
 
+    @patch("app.server._is_public_hostname", return_value=True)
     @patch("app.server._check_llms_txt", new_callable=AsyncMock)
     @patch("app.server._check_mcp", new_callable=AsyncMock)
     @patch("app.server._check_a2a", new_callable=AsyncMock)
@@ -367,10 +377,10 @@ class TestSubmissions:
     @patch("app.server._check_schema_org", new_callable=AsyncMock)
     def test_submission_pending_if_no_surface(
         self,
-        mock_schema, mock_ucp, mock_a2a, mock_mcp, mock_llms,
+        mock_schema, mock_ucp, mock_a2a, mock_mcp, mock_llms, mock_public,
         client
     ):
-        """If no surface found, status should be pending_verification."""
+        """If no surface found, status is still 'pending' (same as detected)."""
         mock_llms.return_value = (False, None)
         mock_mcp.return_value = (False, None)
         mock_a2a.return_value = (False, None)
@@ -384,7 +394,7 @@ class TestSubmissions:
         })
         assert resp.status_code == 202
         data = resp.json()
-        assert data["status"] == "pending_verification"
+        assert data["status"] == "pending"
 
 
 # ===========================================================================

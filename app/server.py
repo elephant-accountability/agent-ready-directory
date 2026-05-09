@@ -13,10 +13,14 @@ Routes:
 
 import csv
 import hashlib
+import hmac
 import io
+import ipaddress
 import json
 import logging
 import os
+import re
+import socket
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,7 +31,8 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import __version__
 from .db import get_db, init_db, get_connection
@@ -109,6 +114,43 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Default deny-by-default security headers on every response.
+
+    Frontend uses inline <script> blocks today, so script-src includes
+    'unsafe-inline'. Move scripts into /static/*.js and tighten this CSP
+    in a follow-up. HSTS is set unconditionally because Fly's edge
+    terminates TLS and force_https=true in fly.toml — clients should
+    cache that.
+    """
+
+    _CSP = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("Content-Security-Policy", self._CSP)
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        return response
+
+
+app.add_middleware(_SecurityHeadersMiddleware)
+
+
 # ---------------------------------------------------------------------------
 # Static files
 # ---------------------------------------------------------------------------
@@ -128,28 +170,89 @@ def require_admin(request: Request) -> None:
     if not admin_token:
         raise HTTPException(status_code=403, detail="Admin token not configured.")
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or auth[7:] != admin_token:
+    if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], admin_token):
         raise HTTPException(status_code=403, detail="Forbidden.")
+
+
+def _client_ip(request: Request) -> str:
+    """Resolve the originating client IP. Trust only Fly's edge.
+
+    Fly-Client-IP is set by Fly's edge proxy after stripping any client-supplied
+    value, so it is safe to trust on the agent-ready-directory deployment. Falls
+    back to request.client.host for local/dev runs where Fly is not in front.
+    """
+    fly_ip = request.headers.get("Fly-Client-IP")
+    if fly_ip:
+        return fly_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _hash_ip(raw_ip: str) -> str:
+    """HMAC-SHA256 of an IP, keyed on a server secret.
+
+    SHA-256 of an IPv4 has only ~2^32 keyspace and is trivially brute-forced if
+    submissions ever leak. Keying with SUBMISSION_IP_SECRET (or ADMIN_TOKEN as
+    a fallback) makes recovery require the secret. If neither is set the hash
+    is still keyed on a process-stable random value, but rotated on restart.
+    """
+    secret = os.getenv("SUBMISSION_IP_SECRET") or os.getenv("ADMIN_TOKEN", "") or _BOOT_SECRET
+    return hmac.new(secret.encode(), raw_ip.encode(), hashlib.sha256).hexdigest()
+
+
+_BOOT_SECRET = os.urandom(32).hex()
+
+# RFC 1123 hostname: labels of [a-z0-9-], no leading/trailing hyphen, dot-joined,
+# total length <= 253. Must contain at least one dot (no bare TLDs / no localhost).
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(?:\.(?!-)[a-z0-9-]{1,63}(?<!-))+$"
+)
+
+
+def _is_public_hostname(host: str) -> bool:
+    """True iff host is a syntactically valid public DNS name and every A/AAAA
+    it resolves to is a globally-routable address.
+
+    Blocks loopback, link-local, RFC1918 private, CGNAT (100.64/10), unique
+    local IPv6, and the IPv4-mapped/embedded variants. Used to gate the
+    submission verifier so an attacker cannot point us at internal services
+    (SSRF).
+    """
+    if not _HOSTNAME_RE.match(host):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global or ip.is_multicast or ip.is_reserved:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 class SubmissionIn(BaseModel):
-    domain: str
-    company_name: str
-    submitted_by_email: str | None = None
-    category: str | None = None
+    domain: str = Field(min_length=4, max_length=253)
+    company_name: str = Field(min_length=1, max_length=200)
+    submitted_by_email: str | None = Field(default=None, max_length=320)
+    category: str | None = Field(default=None, max_length=64)
 
     @field_validator("domain")
     @classmethod
     def clean_domain(cls, v: str) -> str:
-        # Strip protocol and trailing slashes
+        # Strip protocol, trailing slash, surrounding whitespace, and any path
+        # / query / fragment a user might paste in. The remainder must be a
+        # bare hostname; SSRF gating happens later in _is_public_hostname.
         v = v.strip().lower()
         for prefix in ("https://", "http://"):
             if v.startswith(prefix):
                 v = v[len(prefix):]
-        return v.rstrip("/")
+        v = v.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].rstrip(".")
+        if not _HOSTNAME_RE.match(v):
+            raise ValueError("domain must be a public DNS hostname")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -384,12 +487,14 @@ async def create_submission(
     Submit a company for verification.
 
     Rate limit: max 3 submissions per IP per 24 hours.
-    If any surface verifies, inserts the company immediately.
+    Submissions land as status='pending' and are promoted to 'verified' by an
+    admin (or the EVI scoring pipeline). The verifier still runs so the public
+    /api/submissions response can show which surfaces were detected, but a
+    detection alone never auto-publishes — that prevents brand-hijack via
+    attacker-controlled /.well-known/*.json on an unrelated domain.
     """
-    # --- IP hash ---
-    forwarded = request.headers.get("X-Forwarded-For")
-    raw_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
-    ip_hash = hashlib.sha256(raw_ip.encode()).hexdigest()
+    raw_ip = _client_ip(request)
+    ip_hash = _hash_ip(raw_ip)
 
     # --- Rate limit check ---
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
@@ -431,78 +536,83 @@ async def create_submission(
         idx += 1
 
     # --- Run verifier (uses module-level imports so tests can mock them) ---
+    # SSRF guard: only fetch domains that resolve to public IPs. Without this,
+    # an attacker can submit "169.254.169.254" or "localhost" and the server
+    # makes requests against internal endpoints on its behalf.
     import httpx as _httpx
 
-    verification_results: dict[str, bool] = {}
-    verification_endpoints: dict[str, str | None] = {}
+    verification_results: dict[str, bool] = {s: False for s in ["llms_txt", "mcp", "a2a", "ucp", "schema_org"]}
+    verification_endpoints: dict[str, str | None] = {s: None for s in verification_results}
 
-    try:
-        async with _httpx.AsyncClient(
-            timeout=_httpx.Timeout(TIMEOUT),
-            headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
-        ) as client:
-            # These names are module-level imports from verifier — mockable by tests
-            verification_results["llms_txt"], verification_endpoints["llms_txt"] = await _check_llms_txt(client, body.domain)
-            verification_results["mcp"], verification_endpoints["mcp"] = await _check_mcp(client, body.domain)
-            verification_results["a2a"], verification_endpoints["a2a"] = await _check_a2a(client, body.domain)
-            verification_results["ucp"], verification_endpoints["ucp"] = await _check_ucp(client, body.domain)
-            verification_results["schema_org"], verification_endpoints["schema_org"] = await _check_schema_org(client, body.domain)
-    except Exception as exc:
-        logger.warning("Verification failed for %s: %s", body.domain, exc)
-        verification_results = {s: False for s in ["llms_txt", "mcp", "a2a", "ucp", "schema_org"]}
-        verification_endpoints = {s: None for s in verification_results}
+    if not _is_public_hostname(body.domain):
+        logger.info("submission %s: domain %s rejected by SSRF guard", submission_id, body.domain)
+    else:
+        try:
+            async with _httpx.AsyncClient(
+                timeout=_httpx.Timeout(TIMEOUT),
+                headers={"User-Agent": USER_AGENT},
+                # Redirects are intentionally disabled for submissions: a 302
+                # to a private address would defeat the SSRF guard above. The
+                # scheduled verifier on already-stored companies still follows
+                # redirects because those domains were gated at submission.
+                follow_redirects=False,
+            ) as client:
+                verification_results["llms_txt"], verification_endpoints["llms_txt"] = await _check_llms_txt(client, body.domain)
+                verification_results["mcp"], verification_endpoints["mcp"] = await _check_mcp(client, body.domain)
+                verification_results["a2a"], verification_endpoints["a2a"] = await _check_a2a(client, body.domain)
+                verification_results["ucp"], verification_endpoints["ucp"] = await _check_ucp(client, body.domain)
+                verification_results["schema_org"], verification_endpoints["schema_org"] = await _check_schema_org(client, body.domain)
+        except Exception as exc:
+            logger.warning("Verification failed for %s: %s", body.domain, exc)
 
     any_verified = any(verification_results.values())
 
-    if any_verified:
-        # Insert company
-        conn.execute(
-            """
-            INSERT INTO companies
-                (slug, name, domain, category, description, website_url,
-                 submitted_by_email, submitted_at, status,
-                 elephant_verified, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'verified', 0, ?, ?)
-            """,
-            (
-                slug,
-                body.company_name,
-                body.domain,
-                body.category,
-                None,
-                f"https://{body.domain}",
-                body.submitted_by_email,
-                now,
-                now,
-                now,
-            ),
-        )
-        conn.commit()
-        company_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+    # Brand-hijack fix: every submission lands as 'pending'. Promotion to
+    # 'verified' is admin-gated (POST /api/admin/companies/{slug}/promote),
+    # so an attacker who controls evil.com cannot self-publish a row that
+    # claims to be Microsoft just by serving a /.well-known/mcp.json.
+    conn.execute(
+        """
+        INSERT INTO companies
+            (slug, name, domain, category, description, website_url,
+             submitted_by_email, submitted_at, status,
+             elephant_verified, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+        """,
+        (
+            slug,
+            body.company_name,
+            body.domain,
+            body.category,
+            None,
+            f"https://{body.domain}",
+            body.submitted_by_email,
+            now,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    company_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
 
-        # Insert surface statuses
-        update_surface_statuses(conn, company_id, verification_results, verification_endpoints)
+    update_surface_statuses(conn, company_id, verification_results, verification_endpoints)
 
-        # Link submission
-        conn.execute(
-            "UPDATE submissions SET verified = 1, company_id = ? WHERE id = ?",
-            (company_id, submission_id),
-        )
-        conn.commit()
+    conn.execute(
+        "UPDATE submissions SET verified = ?, company_id = ? WHERE id = ?",
+        (1 if any_verified else 0, company_id, submission_id),
+    )
+    conn.commit()
 
-        return {
-            "status": "verified",
-            "message": "Company verified and added to directory.",
-            "slug": slug,
-            "surfaces": verification_results,
-        }
-    else:
-        return {
-            "status": "pending_verification",
-            "message": "No agent-discovery surfaces found. Submission recorded for manual review.",
-            "surfaces": verification_results,
-        }
+    return {
+        "status": "pending",
+        "message": (
+            "Submission recorded; surfaces detected — awaiting admin review."
+            if any_verified
+            else "No agent-discovery surfaces found. Submission recorded for manual review."
+        ),
+        "slug": slug,
+        "surfaces": verification_results,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +820,32 @@ async def admin_elephant_verify(
     )
     conn.commit()
     return {"slug": slug, "elephant_verified": bool(new_val)}
+
+
+@app.post("/api/admin/companies/{slug}/promote")
+async def admin_promote_company(
+    slug: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Promote a 'pending' submission to 'verified'. Counterpart to the
+    brand-hijack fix in /api/submissions: every public submission lands as
+    'pending' and only an admin can flip it to 'verified', which is what
+    surfaces the row in /llms.txt, /sitemap.xml, and the export endpoints.
+    """
+    require_admin(request)
+    row = conn.execute("SELECT id, status FROM companies WHERE slug = ?", (slug,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Company not found.")
+    if row["status"] == "deleted":
+        raise HTTPException(status_code=409, detail="Cannot promote a deleted company.")
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE companies SET status = 'verified', updated_at = ? WHERE slug = ?",
+        (now, slug),
+    )
+    conn.commit()
+    return {"slug": slug, "status": "verified"}
 
 
 @app.delete("/api/admin/companies/{slug}")
